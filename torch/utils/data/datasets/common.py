@@ -1,9 +1,12 @@
 import os
+import sys
 import fnmatch
 import warnings
 import tarfile
-from typing import List, Union, Iterable, Any
+import zipfile
+from typing import List, Union, Iterable, Any, Callable
 from io import BufferedIOBase
+
 
 class StreamWrapper:
     # this is a wrapper class which wraps streaming handle
@@ -46,6 +49,9 @@ class StreamWrapper:
         # put type ignore here to avoid mypy complaining too many args
         self.stream.seek(*args, **kw)  # type: ignore
 
+    def tell(self):
+        return self.stream.tell()
+
 
 def match_masks(name : str, masks : Union[str, List[str]]) -> bool:
     # empty mask matches any input name
@@ -59,6 +65,7 @@ def match_masks(name : str, masks : Union[str, List[str]]) -> bool:
         if fnmatch.fnmatch(name, mask):
             return True
     return False
+
 
 def get_file_pathnames_from_root(
         root: str,
@@ -108,6 +115,19 @@ def validate_pathname_binary(rec):
     return ""
 
 
+def extract_files_from_pathname_binaries(pathname_binaries : Iterable, extract_fn : Callable):
+    if not isinstance(pathname_binaries, Iterable):
+        warnings.warn("pathname_binaries must be Iterable type got {}".format(type(pathname_binaries)))
+        raise TypeError
+
+    for rec in pathname_binaries:
+        ret = validate_pathname_binary(rec)
+        if ret:
+            warnings.warn("encounter invalid pathname and binary record ({}), abort!".format(ret))
+            raise TypeError
+        yield from extract_fn(rec[0], rec[1])
+
+
 def extract_files_from_single_tar_pathname_binary(
         pathname : str,
         binary_stream : Any):
@@ -128,28 +148,43 @@ def extract_files_from_single_tar_pathname_binary(
                 inner_pathname = os.path.normpath(os.path.join(pathname, tarinfo.name))
                 yield (inner_pathname, StreamWrapper(extract_fobj))
             return
-    except tarfile.TarError:
+    except tarfile.TarError as e:
         # Note: We have no way to verify whether a non-seekable stream (eg. PIPE stream) is tar without
         #       changing stream handle position, however, there is no way to move such stream's handle back.
         #       So the entire tar extraction process will be aborted if a non-seekable stream is not tar exactable.
         if not seekable:
             warnings.warn("Unable to reset the non-tarfile stream {}, abort!".format(pathname))
-            raise tarfile.ExtractError
+            raise e
         binary_stream.seek(0)
 
-    yield (pathname, binary_stream)
+    # yield original pathname binary tuple if the binary stream is not a zip stream
+    yield (pathname, StreamWrapper(binary_stream))
 
 
-def extract_files_from_tar_pathname_binaries(pathname_binaries : Iterable):
-    if not isinstance(pathname_binaries, Iterable):
-        warnings.warn("pathname_binaries must be Iterable type got {}".format(type(pathname_binaries)))
-        raise TypeError
+def extract_files_from_single_zip_pathname_binary(
+        pathname : str,
+        binary_stream : Any):
+    # test whether binary_stream is seekable (eg. PIPE stream from webdata is not seekable)
+    seekable = hasattr(binary_stream, "seekable") and binary_stream.seekable()
 
-    for rec in pathname_binaries:
-        ret = validate_pathname_binary(rec)
+    try:
+        with zipfile.ZipFile(binary_stream) as zips:
+            for zipinfo in zips.infolist():
+                # major version should always be 3 here.
+                if (sys.version_info[1] < 6 and zipinfo.filename.endswith('/')) or zipinfo.is_dir():
+                    continue
 
-        if ret:
-            warnings.warn("encounter invalid pathname and binary record ({}), abort!".format(ret))
-            raise TypeError
+                inner_pathname = os.path.normpath(os.path.join(pathname, zipinfo.filename))
+                yield (inner_pathname, StreamWrapper(zips.open(zipinfo)))
+            return
+    except zipfile.BadZipFile as e:
+        # Note: We have no way to verify whether a non-seekable stream (eg. PIPE stream) is zip without
+        #       changing stream handle position, however, there is no way to move such stream's handle back.
+        #       So the entire zip extraction process will be aborted if a non-seekable stream is not tar exactable.
+        if not seekable:
+            warnings.warn("Unable to reset the non-zip stream {}, skip!".format(pathname))
+            raise e
+        binary_stream.seek(0)
 
-        yield from extract_files_from_single_tar_pathname_binary(rec[0], rec[1])
+    # yield original pathname binary tuple if the binary stream is not a zip stream
+    yield (pathname, StreamWrapper(binary_stream))
